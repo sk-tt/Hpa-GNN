@@ -1,0 +1,358 @@
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from torch.nn.parameter import Parameter
+from metis import part_graph
+from collections import OrderedDict
+import time
+import os
+
+class HybridParallelGNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(HybridParallelGNN, self).__init__()
+        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, output_dim)
+    
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = self.conv2(x, edge_index)
+        return F.log_softmax(x, dim=1)
+
+class GCNConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(GCNConv, self).__init__()
+        self.weight = Parameter(torch.Tensor(in_channels, out_channels))
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.weight)
+    
+    def forward(self, x, adj):
+        x = torch.matmul(x, self.weight)
+        
+        return torch.matmul(adj, x)
+
+class MatrixPartitioner:
+    def __init__(self, n, m):
+        self.n = n  # 行分块数
+        self.m = m  # 列分块数
+    
+    def partition_matrix(self, matrix, dim0, dim1):
+        if len(matrix.shape) == 1:  # 向量
+            return self._partition_vector(matrix, dim0)
+        
+        row_chunks = torch.tensor_split(matrix, self.n, dim=dim0)
+        blocks = []
+        for row_chunk in row_chunks:
+            col_chunks = torch.tensor_split(row_chunk, self.m, dim=dim1)
+            blocks.append(col_chunks)
+        return blocks
+    
+    def _partition_vector(self, vector, dim):
+        return torch.tensor_split(vector, self.n * self.m, dim=dim)
+
+class DistributedTrainer:
+    def __init__(self, model, dataset, n, m, pipeline_depth=4, use_fp16=True):
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+        self.device = torch.device(f'cuda:{self.rank}')
+        
+        self.i = self.rank // m
+        self.j = self.rank % m
+        self.n = n
+        self.m = m
+        
+        self.model = model.to(self.device)
+        self.dataset = dataset
+        self.pipeline_depth = pipeline_depth
+        self.use_fp16 = use_fp16
+        
+        self.partitioner = MatrixPartitioner(n, m)
+        
+        self.comp_stream = torch.cuda.Stream(device=self.device)
+        self.comm_stream = torch.cuda.Stream(device=self.device)
+        
+        self.local_X = None
+        self.local_A_blocks = None
+        self.local_W = None
+        self.vertex_map = None
+    
+    def prepare_data(self):
+        if self.rank == 0:
+            data = self.dataset[0]
+            adj_matrix = self._build_adj_matrix(data.edge_index, data.num_nodes)
+            features = data.x
+            labels = data.y
+            
+            _, parts = part_graph(adj_matrix.cpu().numpy(), nparts=self.world_size)
+            self.vertex_map = torch.tensor(parts, device=self.device)
+            
+            X_blocks = self.partitioner.partition_matrix(features, 0, 1)  # (b, d) -> (n, m)
+            A_blocks = self.partitioner.partition_matrix(adj_matrix, 0, 1) # (b, b) -> (n, n)
+            
+            data_packs = []
+            for i in range(self.n):
+                for j in range(self.m):
+                    pack = {
+                        'X': X_blocks[i][j],
+                        'A': [A_blocks[i][k] for k in range(self.n)],  # 第i行所有邻接块
+                        'vertex_map': self.vertex_map
+                    }
+                    data_packs.append(pack)
+        else:
+            data_packs = [None] * self.world_size
+        
+        local_pack = [None]
+        dist.scatter_object_list(local_pack, data_packs, src=0)
+        
+        self.local_X = local_pack[0]['X'].to(self.device)
+        self.local_A_blocks = [block.to(self.device) for block in local_pack[0]['A']]
+        self.vertex_map = local_pack[0]['vertex_map'].to(self.device)
+        
+        self._distribute_weights()
+    
+    def _distribute_weights(self):
+        if self.rank == 0:
+            weight = self.model.conv1.weight.data
+            W_blocks = self.partitioner.partition_matrix(weight, 0, 1)  # (d, h) -> (n, m)
+            
+            weight_packs = []
+            for i in range(self.n):
+                for j in range(self.m):
+                    # GPU(i,j)获取第j列所有权重块
+                    pack = [W_blocks[k][j] for k in range(self.n)]
+                    weight_packs.append(pack)
+        else:
+            weight_packs = [None] * self.world_size
+        
+        local_weight_pack = [None]
+        dist.scatter_object_list(local_weight_pack, weight_packs, src=0)
+        self.local_W = [w.to(self.device) for w in local_weight_pack[0]]
+    
+    def _build_adj_matrix(self, edge_index, num_nodes):
+        adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+        adj[edge_index[0], edge_index[1]] = 1.0
+        return adj
+    
+    def local_forward(self, X_ij, W_j):
+        Y_ij = torch.matmul(X_ij, W_j)
+        
+        Z_ij = None
+        for k in range(self.n):
+            A_ik = self.local_A_blocks[k]
+            Z_ik = torch.matmul(A_ik, Y_ij)
+            if Z_ij is None:
+                Z_ij = Z_ik
+            else:
+                Z_ij += Z_ik
+        
+        return Z_ij
+    
+    def communicate_z(self, Z_ij):
+        if self.use_fp16:
+            Z_send = Z_ij.half()
+        else:
+            Z_send = Z_ij
+
+        target_rank = (self.rank + 1) % self.world_size
+        source_rank = (self.rank - 1) % self.world_size
+        
+        send_req = dist.isend(Z_send, dst=target_rank)
+        
+        recv_buffer = torch.zeros_like(Z_send)
+        recv_req = dist.irecv(recv_buffer, src=source_rank)
+        
+        send_req.wait()
+        recv_req.wait()
+        
+        Z_recv = recv_buffer.float() if self.use_fp16 else recv_buffer
+        
+        Z_aggregated = Z_ij + Z_recv
+        
+        return Z_aggregated
+    
+    def backward_and_update(self, Z_aggregated, y_true):
+        loss = F.nll_loss(Z_aggregated, y_true)
+        
+        loss.backward()
+        
+        grad_W_local = []
+        for k in range(self.n):
+            grad_W_k = torch.matmul(self.local_X.t(), 
+                                   torch.matmul(self.local_A_blocks[k].t(), 
+                                               Z_aggregated.grad))
+            grad_W_local.append(grad_W_k)
+
+        for grad in grad_W_local:
+            dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+            grad /= self.world_size
+        
+        for k in range(self.n):
+            self.local_W[k] -= 0.01 * grad_W_local[k]  # SGD更新
+        
+        return loss.item()
+    
+    def pipeline_step(self, epoch, micro_batch_idx):
+        with torch.cuda.stream(self.comp_stream):
+            start_idx = micro_batch_idx * self.micro_batch_size
+            end_idx = (micro_batch_idx + 1) * self.micro_batch_size
+            X_micro = self.local_X[start_idx:end_idx]
+            
+            Z_local = self.local_forward(X_micro, self.local_W[self.i])
+        
+        with torch.cuda.stream(self.comm_stream):
+            if micro_batch_idx > 0:
+                self.communicate_z(self.prev_Z)
+            
+            self.prev_Z = Z_local.detach()
+        
+        if micro_batch_idx >= 3:
+            with torch.cuda.stream(self.comp_stream):
+                labels_micro = self.local_labels[micro_batch_idx-3]
+                loss = self.backward_and_update(self.Z_buffers[micro_batch_idx % 4], labels_micro)
+                
+                if micro_batch_idx % 10 == 0 and self.rank == 0:
+                    print(f"Epoch {epoch} MicroBatch {micro_batch_idx} Loss: {loss:.4f}")
+        
+        self.Z_buffers[micro_batch_idx % 4] = Z_local
+    
+    def train(self, epochs):
+        num_nodes = self.local_X.size(0)
+        self.micro_batch_size = num_nodes // self.pipeline_depth
+        
+        if self.rank == 0:
+            labels = self.dataset[0].y
+            label_blocks = self.partitioner.partition_matrix(labels, 0, 0)
+            label_packs = []
+            for i in range(self.n):
+                for j in range(self.m):
+                    label_packs.append(label_blocks[i*self.m + j])
+        else:
+            label_packs = [None] * self.world_size
+        
+        local_label = [None]
+        dist.scatter_object_list(local_label, label_packs, src=0)
+        self.local_labels = local_label[0].to(self.device)
+        
+        self.Z_buffers = [None] * 4
+        self.prev_Z = None
+        
+        for epoch in range(epochs):
+            if epoch % 5 == 0:
+                self.prepare_data()
+            
+            for mb_idx in range(self.pipeline_depth):
+                self.pipeline_step(epoch, mb_idx)
+
+            torch.cuda.synchronize()
+
+            self._synchronize_weights()
+
+            if epoch % 5 == 0 and self.rank == 0:
+                acc = self.evaluate()
+                print(f"Epoch {epoch} Validation Accuracy: {acc:.4f}")
+
+            if epoch % 10 == 0:
+                self.save_checkpoint(epoch)
+
+    def _synchronize_weights(self):
+        all_W = [None] * self.world_size
+        dist.all_gather_object(all_W, self.local_W)
+
+        if self.rank == 0:
+            global_W = []
+            for i in range(self.n):
+                row_blocks = []
+                for j in range(self.m):
+                    rank_idx = i * self.m + j
+                    W_col_j = all_W[rank_idx]
+                    W_row_i = torch.cat(W_col_j, dim=0)
+                    row_blocks.append(W_row_i)
+                global_row = torch.cat(row_blocks, dim=1)
+                global_W.append(global_row)
+
+            global_weight = torch.cat(global_W, dim=0)
+            self.model.conv1.weight.data.copy_(global_weight)
+
+        if self.rank == 0:
+            weight_tensor = self.model.conv1.weight.data
+        else:
+            weight_tensor = torch.empty(
+                (self.model.conv1.in_channels, self.model.conv1.out_channels),
+                device=self.device
+            )
+        dist.broadcast(weight_tensor, src=0)
+
+        W_blocks = self.partitioner.partition_matrix(weight_tensor, 0, 1)
+        self.local_W = [W_blocks[k][self.j] for k in range(self.n)]
+
+    def evaluate(self):
+        if self.rank != 0:
+            return 0.0
+
+        data = self.dataset[0]
+        self.model.eval()
+        with torch.no_grad():
+            output = self.model(data.x, data.edge_index)
+            pred = output.max(1)[1]
+            acc = pred.eq(data.y).sum().item() / data.y.size(0)
+        self.model.train()
+        return acc
+
+    def save_checkpoint(self, epoch):
+        checkpoint = {
+            'epoch': epoch,
+            'model_state': self.model.state_dict(),
+            'vertex_map': self.vertex_map.cpu(),
+            'partition_info': {
+                'n': self.n,
+                'm': self.m
+            }
+        }
+        torch.save(checkpoint, f'checkpoint_rank{self.rank}_epoch{epoch}.pt')
+
+    def load_checkpoint(self, checkpoint_path):
+        checkpoint = torch.load(checkpoint_path)
+        self.model.load_state_dict(checkpoint['model_state'])
+        self.vertex_map = checkpoint['vertex_map'].to(self.device)
+        return checkpoint['epoch']
+
+def main():
+    dist.init_process_group(backend='nccl')
+    rank = dist.get_rank()
+    local_rank = rank % torch.cuda.device_count()
+    torch.cuda.set_device(local_rank)
+
+    n, m = 4, 2
+    pipeline_depth = 8
+
+    from torch_geometric.datasets import Planetoid
+    dataset = Planetoid(root='/tmp/Cora', name='Cora')
+
+    model = HybridParallelGNN(
+        input_dim=dataset.num_features,
+        hidden_dim=16,
+        output_dim=dataset.num_classes
+    )
+
+    trainer = DistributedTrainer(
+        model=model,
+        dataset=dataset,
+        n=n,
+        m=m,
+        pipeline_depth=pipeline_depth,
+        use_fp16=True
+    )
+
+    trainer.prepare_data()
+
+    epochs = 100
+    trainer.train(epochs)
+
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()
