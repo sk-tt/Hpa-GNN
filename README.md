@@ -4,7 +4,8 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.1%2B-red)](https://pytorch.org)
 [![Paper](https://img.shields.io/badge/Paper-PDF-green)]()
 
-This project is qualified for participation in the "National Pioneer Cup on Intelligent Computing – Shandong University of Science and Technology Selection
+This project is qualified for participation in the "National Pioneer Cup on Intelligent Computing – Shandong University of Science and Technology Selection.
+
 Hpa-GNN is an innovative distributed training framework designed for graph neural networks (GNNs) at billion-node scale. Through hybrid parallel architecture and communication optimization techniques, this framework breaks through the "memory wall" and "communication wall" of traditional GNN training, enabling efficient full-graph training.
 
 ## Core Challenges and Solutions
