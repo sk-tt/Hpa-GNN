@@ -1,0 +1,17 @@
+__pycache__/
+data/
+job_scripts/
+outputs/
+profs/
+sparse-extension/build/
+sparse-extension/dist/
+sparse-extension/sparse_coo_tensor_cpp.egg-info/
+sparse_coo_tensor_cpp.egg-info/
+.*.swp
+.nfs*
+*.txt
+*.pt
+*.qdrep
+tests/
+job*
+slurm_outputs/
